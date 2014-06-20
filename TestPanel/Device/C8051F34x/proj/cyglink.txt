@@ -1,0 +1,2 @@
+"E:\mcu_proj\Bang tung tac\TestPanel\Device\C8051F34x\proj\USB_MAIN.obj",
+"E:\mcu_proj\USBXpress\USBXpress_API\Device\C8051F34x\USBX_F34X.LIB"  TO "E:\mcu_proj\Bang tung tac\TestPanel\Device\C8051F34x\proj\TestPanel" RS(256) PL(68) PW(78) XDATA(?XD?_USB_INIT?USB_API(0x07AF))  

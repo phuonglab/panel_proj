@@ -1,0 +1,383 @@
+//-----------------------------------------------------------------------------
+// USB_MAIN.c
+//-----------------------------------------------------------------------------
+// Copyright 2002 Silicon Laboratories, Inc.
+//
+// AUTH: JS
+// DATE: 22 FEB 02
+//
+//
+// Target: C8051F34x
+// Tool chain: KEIL C51 6.03 / KEIL EVAL C51
+//             SDCC 2.8.0
+//             Raisonance RC51 V03.03.48
+//
+// REVISIONS:
+// 1/20/11  - ES: Disabled VREF and Temp Sensor before going into suspend.
+//          -     Modified temperature calculation
+// 3/25/10  - ES: Added support for Raisonance.
+// 5/26/09  - ES: Ported Code to compiler independent format.
+//                Compatible with SDCC.
+// 10/11/06 - PKC: Changed port I/O and ADC Mux settings to accommodate
+//            potentiometer at P2.5 on the 'F340 Target Board; Changed
+//            USBXpress API interrupt to 17.
+// 1/24/06  - PKC: Changed 'F320.h to 'F340.h
+// 4/4/03   - DM:   Ported code to use USB_API.lib instead of custom solution.
+// 5/6/03   - DM: Made changes to use new driver with better throughput.
+// 11/22/02 - DM:  Added support for switches and sample USB
+//            interrupt application.
+//
+// Obs: This program uses the following equation from the datasheet, chapter
+//       5.2:  Vtemp = 2.86T(C) + 776mV
+//
+//       Moving T(C) to the left-hand side we have:
+//
+//          T(C) = (1 / 2.86)Vtemp - (776mV / 2.86)
+//
+//       In this instance the equivalent linear equation is given by:
+//
+//          T(C) = 0.3497Vtemp - 271.33 (V in millivolts)
+//
+//       Converting from V to ADC would give us:
+//
+//          T(C) = (0.3497*VDD*ADC/1024) - 271.33;
+//
+//       Assuming a VDD = 3300 mV it leads to:
+//
+//          T(C) = 1.126*ADC_sum - 271.33;
+//
+//       To allow for precise calculations using fixed point math these
+//       factors are going to be scaled up 1000x
+//
+//-----------------------------------------------------------------------------
+// Includes
+//-----------------------------------------------------------------------------
+#include "compiler_defs.h"
+#include "C8051f340_defs.h"
+#include <stddef.h>
+#include "USB_API.h"
+
+#define INTERRUPT_USBXpress 17
+
+//-----------------------------------------------------------------------------
+// Global CONSTANTS
+//-----------------------------------------------------------------------------
+
+//SBIT(Led1, SFR_P2, 2);                    // LED='1' means ON
+SBIT(Led2, SFR_P2, 3);
+sbit Led1 = P2^2
+
+#define Sw1 0x01                          // These are the port2 bits for Sw1
+#define Sw2 0x02                          // and Sw2 on the development board
+
+#define OVER_ROUND 10                     // Number of shifts (>>N) to reach the
+                                          // correct number of bits of precision
+#define SCALE 1000L                       // Scale for temp calculations
+#define SLOPE 1148077                     // Slope of the temp transfer function
+#define SLOPE_DIV_1024 1126               // Slope of the temp transfer function divided by 1024
+#define OFFSET 271329L                    // Offset for the temp transfer function
+
+U8 Switch1State = 0;                      // Indicate status of switch
+U8 Switch2State = 0;                      // starting at 0 == off
+
+U8 Toggle1 = 0;                           // Variable to make sure each button
+U8 Toggle2 = 0;                           // press and release toggles switch
+
+U8 Potentiometer = 0x00;                  // Last read potentiometer value
+U8 Temperature = 0x00;                    // Last read temperature sensor value
+
+U8 Out_Packet[8] = {0,0,0,0,0,0,0,0};     // Last packet received from host
+U8 In_Packet[8]  = {0,0,0,0,0,0,0,0};     // Next packet to sent to host
+
+/*** [BEGIN] USB Descriptor Information [BEGIN] ***/
+SEGMENT_VARIABLE(USB_VID, U16, SEG_CODE) = 0x10C4;
+SEGMENT_VARIABLE(USB_PID, U16, SEG_CODE) = 0xEA61;
+SEGMENT_VARIABLE(USB_MfrStr[], U8, SEG_CODE) = // Manufacturer String
+{
+   0x1A,
+   0x03,
+   'S',0,
+   'i',0,
+   'l',0,
+   'i',0,
+   'c',0,
+   'o',0,
+   'n',0,
+   ' ',0,
+   'L',0,
+   'a',0,
+   'b',0,
+   's',0
+};
+SEGMENT_VARIABLE(USB_ProductStr[], U8, SEG_CODE) = // Product Desc. String
+{
+   0x10,
+   0x03,
+   'U',0,
+   'S',0,
+   'B',0,
+   ' ',0,
+   'A',0,
+   'P',0,
+   'I',0
+};
+
+SEGMENT_VARIABLE(USB_SerialStr[], U8, SEG_CODE) = // Serial Number String
+{
+   0x0A,
+   0x03,
+   '1',0,
+   '2',0,
+   '3',0,
+   '4',0
+};
+
+SEGMENT_VARIABLE(USB_MaxPower, U8, SEG_CODE) = 15;    // Max current = 30 mA
+                                                      // (15 * 2)
+SEGMENT_VARIABLE(USB_PwAttributes, U8, SEG_CODE) = 0x80;    // Bus-powered,
+                                                            // remote wakeup not
+                                                            // supported
+SEGMENT_VARIABLE(USB_bcdDevice, U16, SEG_CODE) = 0x0100;    // Device release
+                                                            // number 1.00
+/*** [ END ] USB Descriptor Information [ END ] ***/
+
+SEG_CODE const U8 TEMP_ADD = 112;           // This constant is added to Temperature
+
+//-----------------------------------------------------------------------------
+// Function Prototypes
+//-----------------------------------------------------------------------------
+
+void Timer_Init(void);                       // Start timer 2 for use by ADC and to check switches
+void Adc_Init(void);
+void Port_Init(void);
+void Suspend_Device(void);
+void Initialize(void);
+
+//-----------------------------------------------------------------------------
+// Main Routine
+//-----------------------------------------------------------------------------
+void main(void)
+{
+
+   PCA0MD &= ~0x40;                       // Disable Watchdog timer
+
+   USB_Clock_Start();                     // Init USB clock *before* calling USB_Init
+   USB_Init(USB_VID,USB_PID,USB_MfrStr,USB_ProductStr,USB_SerialStr,USB_MaxPower,USB_PwAttributes,USB_bcdDevice);
+
+   Initialize();
+   USB_Int_Enable();
+   while (1)
+   {
+
+
+    // It is possible that the contents of the following packets can change
+    // while being updated.  This doesn't cause a problem in the sample
+    // application because the bytes are all independent.  If data is NOT
+    // independent, packet update routines should be moved to an interrupt
+    // service routine, or interrupts should be disabled during data updates.
+      if (Out_Packet[0] == 1) Led1 = 1;   // Update status of LED #1
+      else Led1 = 0;
+      if (Out_Packet[1] == 1) Led2 = 1;   // Update status of LED #2
+      else Led2 = 0;
+      P1 = (Out_Packet[2] & 0x0F);        // Set Port 1 pins
+
+
+      In_Packet[0] = Switch1State;        // Send status of switch 1
+      In_Packet[1] = Switch2State;        // and switch 2 to host
+      In_Packet[2] = 0x04;         // Port 0 [0-3] (make sure j9 & j10 jumpered)
+      In_Packet[3] = 0x04;       // Potentiometer value
+      In_Packet[4] = 0x04;         // Temperature sensor value
+
+   }
+}
+
+//-----------------------------------------------------------------------------
+// Initialization Subroutines
+//-----------------------------------------------------------------------------
+
+//-------------------------
+// Port_Init
+//-------------------------
+// Port Initialization
+// - Configure the Crossbar and GPIO ports.
+//
+void Port_Init(void)
+{
+   P2MDOUT |= 0x04;                    // Enable LED as a push-pull output
+   XBR0     = 0x00;
+   XBR1     = 0x40;                        // Enable Crossbar
+}
+
+//-------------------------
+// Timer_Init
+//-------------------------
+// Timer initialization
+// - 1 mhz timer 2 reload, used to check if switch pressed on overflow and
+// used for ADC continuous conversion
+//
+void Timer_Init(void)
+{
+   TMR2CN  = 0x00;                        // Stop Timer2; Clear TF2;
+
+   CKCON  &= ~0xF0;                       // Timer2 clocked based on T2XCLK;
+   TMR2RL  = -(24000000 / 12/100);            // Initialize reload value
+   TMR2    = 0xffff;                      // Set to reload immediately
+
+   ET2     = 1;                           // Enable Timer2 interrupts
+   TR2     = 1;                           // Start Timer2
+}
+
+//-------------------------
+// Adc_Init
+//-------------------------
+// ADC initialization
+// - Configures ADC for single ended continuous conversion or Timer2
+//
+void Adc_Init(void)
+{
+   REF0CN  = 0x0E;                        // Enable voltage reference VREF
+   AMX0P = 0x1E;                          // Positive input starts as temp sensor
+   AMX0N = 0x1F;                          // Single ended mode(negative input = gnd)
+
+   ADC0CF  = 0xF8;                        // SAR Period 0x1F, Right adjusted output
+
+   ADC0CN  = 0xC2;                        // Continuous converion on timer 2 overflow
+                                          // with low power tracking mode on
+
+   EIE1   |= 0x08;                        // Enable conversion complete interrupt
+}
+
+//-------------------------
+// Suspend_Device
+//-------------------------
+// Called when a DEV_SUSPEND interrupt is received.
+// - Disables all unnecessary peripherals
+// - Calls USB_Suspend()
+// - Enables peripherals once device leaves suspend state
+//
+void Suspend_Device(void)
+{
+   // Disable peripherals before calling USB_Suspend()
+   P0MDIN = 0x00;                       // Port 0 configured as analog input
+   P1MDIN = 0x00;                       // Port 1 configured as analog input
+   P2MDIN = 0x00;                       // Port 2 configured as analog input
+   P3MDIN = 0x00;                       // Port 3 configured as analog input
+   REF0CN  &= ~0x0E;                    // Disable voltage reference VREF, Temp Sensor
+   ADC0CN &= ~0x80;                     // Disable ADC0
+   ET2 = 0;                             // Disable Timer 2 Interrupts
+
+
+   USB_Suspend();                       // Put the device in suspend state
+
+   // Once execution returns from USB_Suspend(), device leaves suspend state.
+   // Reenable peripherals
+   REF0CN  = 0x0E;                      // Enable voltage reference VREF, Temp Sensor
+   ADC0CN |= 0x80;                      // Enable ADC0
+   P0MDIN = 0xFF;
+   P1MDIN = 0x7F;                       // Port 1 pin 7 set as analog input
+   P2MDIN = 0xFF;
+   P3MDIN = 0x01;
+   ET2 = 1;                             // Enable Timer 2 Interrupts
+}
+
+//-------------------------
+// Initialize
+//-------------------------
+// Called when a DEV_CONFIGURED interrupt is received.
+// - Enables all peripherals needed for the application
+//
+void Initialize(void)
+{
+   Port_Init();                           // Initialize crossbar and GPIO
+   Timer_Init();                          // Initialize timer2
+   //Adc_Init();                            // Initialize ADC
+
+}
+
+
+//-------------------------
+// Timer2_ISR
+//-------------------------
+// Called when timer 2 overflows, check to see if switch is pressed,
+// then watch for release.
+//
+INTERRUPT(Timer2_ISR, INTERRUPT_TIMER2)
+{
+   
+   Led1 = ~Led1;  
+   TF2H = 0;                              // Clear Timer2 interrupt flag
+}
+
+//-------------------------
+// Adc_ConvComplete_ISR
+//-------------------------
+// Called after a conversion of the ADC has finished
+// - Updates the appropriate variable for either potentiometer or temperature sensor
+// - Switches the Adc multiplexor value to switch between the potentiometer and temp sensor
+//
+INTERRUPT(Adc_ConvComplete_ISR, INTERRUPT_ADC0_EOC)
+{
+   U32 temperature_calc;
+   
+   if (AMX0P == 0x1E)                     // This switches the AMUX between
+   {                                      // the temperature sensor and the
+      temperature_calc = ADC0;            // Read ADC value
+
+      temperature_calc *= SLOPE_DIV_1024; // Multiply Slope of transfer function
+                                          // and divide by 1024 to convert from ADC
+                                          // counts to mV
+
+      temperature_calc -= OFFSET;         // subtract offset from equation
+      temperature_calc /= SCALE;          
+      
+      Temperature   = (U8)temperature_calc;
+
+      AMX0P       = 0x04;                 // switch to potentiometer ('F340 - P2.5)
+      ADC0CF      = 0xFC;                 // place ADC0 in left-adjusted mode
+   }
+   else
+   {
+      Potentiometer = ADC0H;
+      AMX0P       = 0x1E;                 // switch to temperature sensor
+      ADC0CF      = 0xF8;                  // place ADC0 in right-adjusted mode
+   }
+
+   AD0INT = 0;
+   Block_Write(In_Packet, 8);
+}
+
+
+// Example ISR for USB_API
+INTERRUPT(USB_API_TEST_ISR, INTERRUPT_USBXpress)
+{
+   U8 INTVAL = Get_Interrupt_Source();
+
+   if (INTVAL & RX_COMPLETE)
+   {
+      Block_Read(Out_Packet, 8);
+   }
+
+   if (INTVAL & DEV_SUSPEND)
+   {
+        Suspend_Device();
+   }
+
+   if (INTVAL & DEV_CONFIGURED)
+   {
+      Initialize();
+   }
+
+}
+
+// Startup code for SDCC to disablt WDT before initializing variables so that
+// a reset does not occur
+#if defined SDCC
+void _sdcc_external_startup (void)
+{
+   PCA0MD &= ~0x40;                       // Disable Watchdog timer
+}
+#endif
+
+// ============================================================================
+// *** END OF FILE ***
+// ============================================================================
